@@ -1,0 +1,17 @@
+[package]
+name = "gray-voicepro"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Cloud voice tools (Deepgram Aura / Fish Audio TTS, Deepgram nova-3 STT) for the gray agent harness"
+license = "MIT"
+
+[[bin]]
+name = "gray-voicepro"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+strip = true
