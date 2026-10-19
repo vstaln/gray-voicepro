@@ -46,7 +46,7 @@ fn manifest() -> Value {
 fn state_dir() -> PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::home_dir().map(|h| h.join(".gray")))
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(NAME)
 }
@@ -85,7 +85,7 @@ fn have(bin: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-        || Command::new("which")
+        || Command::new(if cfg!(windows) { "where" } else { "which" })
             .arg(bin)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -117,7 +117,11 @@ fn api_err(code: u16, body: &str) -> String {
                 .or_else(|| v.pointer("/error/message"))
                 .or_else(|| v.pointer("/message"))
                 .or_else(|| v.pointer("/detail"))
-                .map(|d| d.as_str().map(str::to_string).unwrap_or_else(|| d.to_string()))
+                .map(|d| {
+                    d.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| d.to_string())
+                })
         })
         .unwrap_or_else(|| body.chars().take(250).collect());
     format!("HTTP {code}: {detail}")
@@ -149,10 +153,17 @@ fn fetch_audio(url: &str, headers: &[String], body: &Value, path: &Path) -> Resu
         let _ = std::fs::remove_file(path);
         return Err(format!(
             "curl: {}",
-            String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>()
         ));
     }
-    let code: u16 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    let code: u16 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
     if !(200..300).contains(&code) {
         let detail = std::fs::read_to_string(path).unwrap_or_default();
         let _ = std::fs::remove_file(path);
@@ -168,15 +179,18 @@ fn fetch_audio(url: &str, headers: &[String], body: &Value, path: &Path) -> Resu
 
 // ---------- tools ------------------------------------------------------------
 
+#[cfg(not(windows))]
 fn play(path: &Path, format: &str) -> Result<String, String> {
     let cands: &[(&str, &[&str])] = if format == "wav" {
         &[
+            ("afplay", &[]),
             ("aplay", &["-q"]),
             ("paplay", &[]),
             ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "error"]),
         ]
     } else {
         &[
+            ("afplay", &[]),
             ("mpg123", &["-q"]),
             ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "error"]),
             ("paplay", &[]),
@@ -198,11 +212,66 @@ fn play(path: &Path, format: &str) -> Result<String, String> {
             return Ok((*bin).into());
         }
     }
-    Err("no player — install alsa-utils (aplay), pulseaudio (paplay), ffmpeg (ffplay) or mpg123".into())
+    Err(
+        "no player — install alsa-utils (aplay), pulseaudio (paplay), ffmpeg (ffplay) or mpg123"
+            .into(),
+    )
+}
+
+/// Windows playback: wav via PowerShell's Media.SoundPlayer (synchronous),
+/// else ffplay, else the file's registered default app via `cmd /C start`.
+#[cfg(windows)]
+fn play(path: &Path, format: &str) -> Result<String, String> {
+    if format == "wav" && have("powershell") {
+        let p = path.display().to_string().replace('\'', "''");
+        let ok = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-c",
+                &format!("(New-Object Media.SoundPlayer '{p}').PlaySync()"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok("powershell".into());
+        }
+    }
+    if have("ffplay") {
+        let ok = Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "error"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok("ffplay".into());
+        }
+    }
+    let cmdline = format!("start \"\" /min \"{}\"", path.display());
+    if Command::new("cmd")
+        .args(["/C", &cmdline])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Ok("default app".into());
+    }
+    Err("no player — install ffmpeg (ffplay) or set a default media app".into())
 }
 
 fn vtts_say(a: &Value) -> Result<String, String> {
-    let text = a["text"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("text required")?;
+    let text = a["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("text required")?;
     let format = a["format"].as_str().unwrap_or("wav");
     if !matches!(format, "wav" | "mp3") {
         return Err(format!("format must be wav|mp3 (got {format})"));
@@ -224,8 +293,9 @@ fn vtts_say(a: &Value) -> Result<String, String> {
     let path = out_dir().join(format!("tts-{ts}.{format}"));
     let bytes = match provider.as_str() {
         "deepgram" => {
-            let key = dg_key()
-                .ok_or("no Deepgram key — export DEEPGRAM_API_KEY or `voicepro setup --deepgram-key …`")?;
+            let key = dg_key().ok_or(
+                "no Deepgram key — export DEEPGRAM_API_KEY or `voicepro setup --deepgram-key …`",
+            )?;
             let model = a["model"]
                 .as_str()
                 .map(str::to_string)
@@ -235,11 +305,17 @@ fn vtts_say(a: &Value) -> Result<String, String> {
             if format == "wav" {
                 url.push_str("&container=wav");
             }
-            fetch_audio(&url, &[format!("Authorization: Token {key}")], &json!({"text": text}), &path)?
+            fetch_audio(
+                &url,
+                &[format!("Authorization: Token {key}")],
+                &json!({"text": text}),
+                &path,
+            )?
         }
         "fish" => {
-            let key = fish_key()
-                .ok_or("no Fish Audio key — export FISH_API_KEY or `voicepro setup --fish-key …`")?;
+            let key = fish_key().ok_or(
+                "no Fish Audio key — export FISH_API_KEY or `voicepro setup --fish-key …`",
+            )?;
             let mut b = json!({"text": text, "format": format});
             if let Some(v) = a["model"].as_str() {
                 b["reference_id"] = json!(v);
@@ -247,7 +323,10 @@ fn vtts_say(a: &Value) -> Result<String, String> {
             let model = env_var("FISH_MODEL").unwrap_or_else(|| "s2.1-pro".into());
             fetch_audio(
                 FISH_TTS,
-                &[format!("Authorization: Bearer {key}"), format!("model: {model}")],
+                &[
+                    format!("Authorization: Bearer {key}"),
+                    format!("model: {model}"),
+                ],
                 &b,
                 &path,
             )?
@@ -304,11 +383,20 @@ fn vstt_listen(a: &Value) -> Result<String, String> {
         url.push_str(&format!("&language={l}"));
     }
     let args: Vec<String> = [
-        "-sS", "--max-time", "90", "-X", "POST", &url,
-        "-H", &format!("Authorization: Token {key}"),
-        "-H", "Content-Type: audio/wav",
-        "--data-binary", &format!("@{}", wav.display()),
-        "-w", "\n%{http_code}",
+        "-sS",
+        "--max-time",
+        "90",
+        "-X",
+        "POST",
+        &url,
+        "-H",
+        &format!("Authorization: Token {key}"),
+        "-H",
+        "Content-Type: audio/wav",
+        "--data-binary",
+        &format!("@{}", wav.display()),
+        "-w",
+        "\n%{http_code}",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -319,7 +407,11 @@ fn vstt_listen(a: &Value) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!(
             "curl: {}",
-            String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(200)
+                .collect::<String>()
         ));
     }
     let s = String::from_utf8_lossy(&out.stdout);
@@ -334,7 +426,11 @@ fn vstt_listen(a: &Value) -> Result<String, String> {
         .unwrap_or("")
         .trim()
         .to_string();
-    if t.is_empty() { Ok("(no speech detected)".into()) } else { Ok(t) }
+    if t.is_empty() {
+        Ok("(no speech detected)".into())
+    } else {
+        Ok(t)
+    }
 }
 
 fn tool(name: &str, args: &Value) -> Value {
@@ -354,11 +450,23 @@ fn tool(name: &str, args: &Value) -> Value {
 fn status() -> String {
     format!(
         "voicepro\n  deepgram key: {}\n  fish key: {}\n  recorder: {}\n  player: {}\n  curl: {}\n  out: {}",
-        if dg_key().is_some() { "set" } else { "MISSING (DEEPGRAM_API_KEY)" },
-        if fish_key().is_some() { "set" } else { "MISSING (FISH_API_KEY)" },
+        if dg_key().is_some() {
+            "set"
+        } else {
+            "MISSING (DEEPGRAM_API_KEY)"
+        },
+        if fish_key().is_some() {
+            "set"
+        } else {
+            "MISSING (FISH_API_KEY)"
+        },
         pick(&["arecord", "rec", "sox"]).unwrap_or("none — install alsa-utils or sox".into()),
-        pick(&["aplay", "paplay", "ffplay", "mpg123"]).unwrap_or("none".into()),
-        if have("curl") { "ok" } else { "MISSING — install curl" },
+        pick(&["afplay", "aplay", "paplay", "ffplay", "mpg123"]).unwrap_or("none".into()),
+        if have("curl") {
+            "ok"
+        } else {
+            "MISSING — install curl"
+        },
         out_dir().display(),
     )
 }
@@ -371,7 +479,8 @@ fn cli(argv: &[String]) -> Result<String, String> {
             while let Some(f) = it.next() {
                 match f.as_str() {
                     "--deepgram-key" => {
-                        c["deepgram_api_key"] = json!(it.next().ok_or("--deepgram-key needs a value")?)
+                        c["deepgram_api_key"] =
+                            json!(it.next().ok_or("--deepgram-key needs a value")?)
                     }
                     "--fish-key" => {
                         c["fish_api_key"] = json!(it.next().ok_or("--fish-key needs a value")?)
@@ -385,7 +494,8 @@ fn cli(argv: &[String]) -> Result<String, String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(config_path(), std::fs::Permissions::from_mode(0o600));
+                let _ =
+                    std::fs::set_permissions(config_path(), std::fs::Permissions::from_mode(0o600));
             }
             Ok(format!("saved {}", config_path().display()))
         }
@@ -402,7 +512,9 @@ fn sidecar() -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let method = v["method"].as_str().unwrap_or("");
         match v.get("id").cloned() {
             None if method == "plugin/shutdown" => return Ok(()),
@@ -420,7 +532,12 @@ fn sidecar() -> std::io::Result<()> {
                 } else if method == "command/run" {
                     let argv: Vec<String> = v["params"]["argv"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let text = cli(&argv).unwrap_or_else(|e| e);
                     json!({"id": id, "result": {"text": text}})
@@ -478,7 +595,8 @@ mod tests {
     struct TempHome;
     impl TempHome {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("gray-voicepro-test-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("gray-voicepro-test-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             unsafe { std::env::set_var("GRAY_HOME", &dir) };
@@ -490,7 +608,8 @@ mod tests {
     }
     impl Drop for TempHome {
         fn drop(&mut self) {
-            let dir = std::env::temp_dir().join(format!("gray-voicepro-test-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("gray-voicepro-test-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -523,7 +642,12 @@ mod tests {
         let _h = TempHome::new();
         let r = tool("vtts_say", &json!({"text": "hi"}));
         assert_eq!(r["result"]["is_error"], true);
-        assert!(r["result"]["content"].as_str().unwrap().contains("DEEPGRAM_API_KEY"));
+        assert!(
+            r["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("DEEPGRAM_API_KEY")
+        );
     }
 
     #[test]
@@ -532,6 +656,11 @@ mod tests {
         let _h = TempHome::new();
         let r = tool("vstt_listen", &json!({"seconds": 1}));
         assert_eq!(r["result"]["is_error"], true);
-        assert!(r["result"]["content"].as_str().unwrap().contains("DEEPGRAM_API_KEY"));
+        assert!(
+            r["result"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("DEEPGRAM_API_KEY")
+        );
     }
 }
