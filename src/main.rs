@@ -38,6 +38,7 @@ fn manifest() -> Value {
              }},
         ],
         "commands": ["/voicepro"], "subcommands": ["voicepro"],
+        "command_descriptions": {"/voicepro": "set up cloud speech and check status"},
     })
 }
 
